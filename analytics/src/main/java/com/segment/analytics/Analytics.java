@@ -24,15 +24,6 @@
 
 package com.segment.analytics;
 
-import static com.segment.analytics.internal.Utils.assertNotNull;
-import static com.segment.analytics.internal.Utils.buffer;
-import static com.segment.analytics.internal.Utils.closeQuietly;
-import static com.segment.analytics.internal.Utils.getInputStream;
-import static com.segment.analytics.internal.Utils.getResourceString;
-import static com.segment.analytics.internal.Utils.getSegmentSharedPreferences;
-import static com.segment.analytics.internal.Utils.hasPermission;
-import static com.segment.analytics.internal.Utils.isNullOrEmpty;
-
 import android.Manifest;
 import android.app.Activity;
 import android.app.Application;
@@ -48,6 +39,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
+
 import com.segment.analytics.integrations.AliasPayload;
 import com.segment.analytics.integrations.BasePayload;
 import com.segment.analytics.integrations.GroupPayload;
@@ -59,6 +51,7 @@ import com.segment.analytics.integrations.TrackPayload;
 import com.segment.analytics.internal.Private;
 import com.segment.analytics.internal.Utils;
 import com.segment.analytics.internal.Utils.AnalyticsNetworkExecutorService;
+
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
@@ -76,6 +69,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static com.segment.analytics.internal.Utils.assertNotNull;
+import static com.segment.analytics.internal.Utils.buffer;
+import static com.segment.analytics.internal.Utils.closeQuietly;
+import static com.segment.analytics.internal.Utils.getInputStream;
+import static com.segment.analytics.internal.Utils.getResourceString;
+import static com.segment.analytics.internal.Utils.getSegmentSharedPreferences;
+import static com.segment.analytics.internal.Utils.hasPermission;
+import static com.segment.analytics.internal.Utils.isNullOrEmpty;
 
 /**
  * The entry point into the Segment for Android SDK.
@@ -98,6 +100,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class Analytics {
 
+  private static final Object LOCK = new Object();
   static final Handler HANDLER =
       new Handler(Looper.getMainLooper()) {
         @Override
@@ -108,6 +111,7 @@ public class Analytics {
   @Private static final String OPT_OUT_PREFERENCE_KEY = "opt-out";
   static final String WRITE_KEY_RESOURCE_IDENTIFIER = "analytics_write_key";
   static final List<String> INSTANCES = new ArrayList<>(1);
+  public static final String V2_PREFIX = "v2_";
   static volatile Analytics singleton = null;
   @Private static final Properties EMPTY_PROPERTIES = new Properties();
   private static final String VERSION_KEY = "version";
@@ -120,6 +124,7 @@ public class Analytics {
   private final @NonNull List<Middleware> middlewares;
   @Private final Options defaultOptions;
   @Private final Traits.Cache traitsCache;
+  @Private final Traits.Cache sentTraitsCache;
   @Private final AnalyticsContext analyticsContext;
   private final Logger logger;
   final String tag;
@@ -128,6 +133,7 @@ public class Analytics {
   private final ProjectSettings.Cache projectSettingsCache;
   final Crypto crypto;
   @Private final Application.ActivityLifecycleCallbacks activityLifecycleCallback;
+  private final boolean optimizeUserTraits;
   ProjectSettings projectSettings; // todo: make final (non-final for testing).
   @Private final String writeKey;
   final int flushQueueSize;
@@ -203,6 +209,7 @@ public class Analytics {
       ExecutorService networkExecutor,
       Stats stats,
       Traits.Cache traitsCache,
+      Traits.Cache sentTraitsCache,
       AnalyticsContext analyticsContext,
       Options defaultOptions,
       @NonNull Logger logger,
@@ -221,11 +228,13 @@ public class Analytics {
       final boolean trackAttributionInformation,
       BooleanPreference optOut,
       Crypto crypto,
-      @NonNull List<Middleware> middlewares) {
+      @NonNull List<Middleware> middlewares,
+      boolean optimizeUserTraits) {
     this.application = application;
     this.networkExecutor = networkExecutor;
     this.stats = stats;
     this.traitsCache = traitsCache;
+    this.sentTraitsCache = sentTraitsCache;
     this.analyticsContext = analyticsContext;
     this.defaultOptions = defaultOptions;
     this.logger = logger;
@@ -242,6 +251,7 @@ public class Analytics {
     this.analyticsExecutor = analyticsExecutor;
     this.crypto = crypto;
     this.middlewares = middlewares;
+    this.optimizeUserTraits = optimizeUserTraits;
 
     namespaceSharedPreferences();
 
@@ -493,24 +503,26 @@ public class Analytics {
       throw new IllegalArgumentException("Either userId or some traits must be provided.");
     }
 
-    Traits traits = traitsCache.get();
-    if (!isNullOrEmpty(userId)) {
-      traits.putUserId(userId);
-    }
-    if (!isNullOrEmpty(newTraits)) {
-      for(Map.Entry<String, Object> entry : newTraits.entrySet()) {
-          if (entry.getValue() instanceof Integer) {
-              traits.put(entry.getKey(), Long.valueOf((Integer) entry.getValue()));
-          } else if (entry.getValue() instanceof Float) {
-              traits.put(entry.getKey(), Double.valueOf((Float) entry.getValue()));
-          } else {
-              traits.put(entry.getKey(), entry.getValue());
+    final Traits traits;
+    synchronized (LOCK) {
+      traits = traitsCache.get();
+      if (!isNullOrEmpty(userId)) {
+          traits.putUserId(userId);
+      }
+      if (!isNullOrEmpty(newTraits)) {
+          for (Map.Entry<String, Object> entry : newTraits.entrySet()) {
+              if (entry.getValue() instanceof Integer) {
+                  traits.put(entry.getKey(), Long.valueOf((Integer) entry.getValue()));
+              } else if (entry.getValue() instanceof Float) {
+                  traits.put(entry.getKey(), Double.valueOf((Float) entry.getValue()));
+              } else {
+                  traits.put(entry.getKey(), entry.getValue());
+              }
           }
       }
+      traitsCache.set(traits); // Save the new traits
+      analyticsContext.setTraits(traits); // Update the references
     }
-
-    traitsCache.set(traits); // Save the new traits
-    analyticsContext.setTraits(traits); // Update the references
 
     analyticsExecutor.submit(
         new Runnable() {
@@ -523,11 +535,31 @@ public class Analytics {
               finalOptions = options;
             }
 
+            Traits traitsToSend;
+            synchronized (LOCK) {
+              traitsToSend = traitsCache.get().unmodifiableCopy();
+            }
+            Traits lastSentTraits = sentTraitsCache.get();
+            if(optimizeUserTraits && !traitsToSend.equals(lastSentTraits)) {
+              IdentifyPayload.Builder builder =
+                      new IdentifyPayload.Builder().traits(transformToV2(traitsToSend));
+              fillAndEnqueue(builder, finalOptions);
+              sentTraitsCache.set(traitsToSend);
+            }
+            // Always send V1
             IdentifyPayload.Builder builder =
-                new IdentifyPayload.Builder().traits(traitsCache.get());
+                    new IdentifyPayload.Builder().traits(traitsToSend);
             fillAndEnqueue(builder, finalOptions);
           }
         });
+  }
+
+  private ValueMap transformToV2(Traits traitsToSend) {
+    ValueMap v2traits = new ValueMap();
+    for (Map.Entry<String, ?> entry : traitsToSend.entrySet()) {
+      v2traits = v2traits.putValue(V2_PREFIX + entry.getKey(), entry.getValue());
+    }
+    return v2traits;
   }
 
   /** @see #group(String, Traits, Options) */
@@ -1085,8 +1117,9 @@ public class Analytics {
     private boolean recordScreenViews = false;
     private boolean trackAttributionInformation = false;
     private Crypto crypto;
+    private boolean optimizeUserTraits;
 
-    /** Start building a new {@link Analytics} instance. */
+      /** Start building a new {@link Analytics} instance. */
     public Builder(Context context, String writeKey) {
       if (context == null) {
         throw new IllegalArgumentException("Context must not be null.");
@@ -1251,6 +1284,11 @@ public class Analytics {
       return this;
     }
 
+      public Builder optimizeUserTraits(boolean optimize) {
+          this.optimizeUserTraits = optimize;
+          return this;
+      }
+
     /**
      * Automatically track application lifecycle events, including "Application Installed",
      * "Application Updated" and "Application Opened".
@@ -1336,7 +1374,7 @@ public class Analytics {
           new BooleanPreference(
               getSegmentSharedPreferences(application, tag), OPT_OUT_PREFERENCE_KEY, false);
 
-      Traits.Cache traitsCache = new Traits.Cache(application, cartographer, tag);
+      Traits.Cache traitsCache = new Traits.Cache(application, cartographer, tag, Traits.Cache.TRAITS_CACHE_PREFIX);
       if (!traitsCache.isSet() || traitsCache.get() == null) {
         Traits traits = Traits.create();
         traitsCache.set(traits);
@@ -1360,29 +1398,31 @@ public class Analytics {
       }
 
       return new Analytics(
-          application,
-          networkExecutor,
-          stats,
-          traitsCache,
-          analyticsContext,
-          defaultOptions,
-          logger,
-          tag,
-          Collections.unmodifiableList(factories),
-          client,
-          cartographer,
-          projectSettingsCache,
-          writeKey,
-          flushQueueSize,
-          flushIntervalInMillis,
-          executor,
-          trackApplicationLifecycleEvents,
-          advertisingIdLatch,
-          recordScreenViews,
-          trackAttributionInformation,
-          optOut,
-          crypto,
-          middlewares);
+              application,
+              networkExecutor,
+              stats,
+              traitsCache,
+              new Traits.Cache(application, cartographer, tag, Traits.Cache.SENT_TRAITS_CACHE_PREFIX),
+              analyticsContext,
+              defaultOptions,
+              logger,
+              tag,
+              Collections.unmodifiableList(factories),
+              client,
+              cartographer,
+              projectSettingsCache,
+              writeKey,
+              flushQueueSize,
+              flushIntervalInMillis,
+              executor,
+              trackApplicationLifecycleEvents,
+              advertisingIdLatch,
+              recordScreenViews,
+              trackAttributionInformation,
+              optOut,
+              crypto,
+              middlewares,
+              optimizeUserTraits);
     }
   }
 
