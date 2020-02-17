@@ -541,12 +541,10 @@ public class Analytics {
             }
             Traits lastSentTraits = sentTraitsCache.get();
             if(optimizeUserTraits && !traitsToSend.equals(lastSentTraits)) {
-              IdentifyPayload.Builder builder =
-                      new IdentifyPayload.Builder().traits(transformToV2(traitsToSend));
-              fillAndEnqueue(builder, finalOptions);
               sentTraitsCache.set(traitsToSend);
+              // Appends V2 with V1 to trigger only one identify
+              traitsToSend = transformToV2(traitsToSend);
             }
-            // Always send V1
             IdentifyPayload.Builder builder =
                     new IdentifyPayload.Builder().traits(traitsToSend);
             fillAndEnqueue(builder, finalOptions);
@@ -554,10 +552,11 @@ public class Analytics {
         });
   }
 
-  private ValueMap transformToV2(Traits traitsToSend) {
-    ValueMap v2traits = new ValueMap();
+  private Traits transformToV2(Traits traitsToSend) {
+    Traits v2traits = new Traits();
+    v2traits.putAll(traitsToSend);
     for (Map.Entry<String, ?> entry : traitsToSend.entrySet()) {
-      v2traits = v2traits.putValue(V2_PREFIX + entry.getKey(), entry.getValue());
+      v2traits.putValue(V2_PREFIX + entry.getKey(), entry.getValue());
     }
     return v2traits;
   }
