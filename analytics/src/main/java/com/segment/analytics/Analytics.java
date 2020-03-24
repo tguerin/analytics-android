@@ -935,6 +935,8 @@ public class Analytics {
     Utils.getSegmentSharedPreferences(application, tag).edit().clear().apply();
     traitsCache.delete();
     traitsCache.set(Traits.create());
+    sentTraitsCache.delete();
+    sentTraitsCache.set(Traits.create());
     analyticsContext.setTraits(traitsCache.get());
     runOnMainThread(IntegrationOperation.RESET);
   }
