@@ -37,8 +37,9 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.segment.analytics.integrations.AliasPayload;
 import com.segment.analytics.integrations.BasePayload;
@@ -496,8 +497,7 @@ public class Analytics {
    * @throws IllegalArgumentException if both {@code userId} and {@code newTraits} are not provided
    * @see <a href="https://segment.com/docs/spec/identify/">Identify Documentation</a>.
    */
-  public void identify(
-      @Nullable String userId, @Nullable Traits newTraits, final @Nullable Options options) {
+  public void identify(@Nullable String userId, @Nullable Traits newTraits, final @Nullable Options options) {
     assertNotShutdown();
     if (isNullOrEmpty(userId) && isNullOrEmpty(newTraits)) {
       throw new IllegalArgumentException("Either userId or some traits must be provided.");
